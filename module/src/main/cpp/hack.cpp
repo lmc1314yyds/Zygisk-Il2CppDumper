@@ -16,23 +16,31 @@
 #include <sys/mman.h>
 #include <linux/unistd.h>
 #include <array>
+#include <vector>
+#include <string>
 
-void hack_start(const char *game_data_dir) {
-    bool load = false;
-    for (int i = 0; i < 10; i++) {
+void *get_unity_handle() {
+    int max_wait_for_unity_seconds = 10;
+
+    for (int i = 0; i < max_wait_for_unity_seconds * 2; i++) {
         void *handle = xdl_open("libil2cpp.so", 0);
         if (handle) {
-            load = true;
-            il2cpp_api_init(handle);
-            il2cpp_dump(game_data_dir);
-            break;
-        } else {
-            sleep(1);
+            return handle;
         }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
-    if (!load) {
-        LOGI("libil2cpp.so not found in thread %d", gettid());
+
+    return nullptr;
+}
+
+void hack_start(const char *game_data_dir) {
+    auto handle = get_unity_handle();
+    if (!handle) {
+        return;
     }
+
+    il2cpp_api_init(handle);
+    il2cpp_dump(game_data_dir);
 }
 
 std::string GetLibDir(JavaVM *vms) {
@@ -61,7 +69,6 @@ std::string GetLibDir(JavaVM *vms) {
                         auto native_library_dir_jstring = (jstring) env->GetObjectField(
                                 application_info, native_library_dir_id);
                         auto path = env->GetStringUTFChars(native_library_dir_jstring, nullptr);
-                        LOGI("lib dir %s", path);
                         std::string lib_dir(path);
                         env->ReleaseStringUTFChars(native_library_dir_jstring, path);
                         return lib_dir;
@@ -118,7 +125,6 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size
     auto libart = dlopen("libart.so", RTLD_NOW);
     auto JNI_GetCreatedJavaVMs = (jint (*)(JavaVM **, jsize, jsize *)) dlsym(libart,
                                                                              "JNI_GetCreatedJavaVMs");
-    LOGI("JNI_GetCreatedJavaVMs %p", JNI_GetCreatedJavaVMs);
     JavaVM *vms_buf[1];
     JavaVM *vms;
     jsize num_vms;
@@ -148,7 +154,6 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size
         nb = dlopen(native_bridge.data(), RTLD_NOW);
     }
     if (nb) {
-        LOGI("nb %p", nb);
         auto callbacks = (NativeBridgeCallbacks *) dlsym(nb, "NativeBridgeItf");
         if (callbacks) {
             LOGI("NativeBridgeLoadLibrary %p", callbacks->loadLibrary);
@@ -172,11 +177,9 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size
                 arm_handle = callbacks->loadLibrary(path, RTLD_NOW);
             }
             if (arm_handle) {
-                LOGI("arm handle %p", arm_handle);
                 auto init = (void (*)(JavaVM *, void *)) callbacks->getTrampoline(arm_handle,
                                                                                   "JNI_OnLoad",
                                                                                   nullptr, 0);
-                LOGI("JNI_OnLoad %p", init);
                 init(vms, (void *) game_data_dir);
                 return true;
             }
@@ -186,10 +189,32 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size
     return false;
 }
 
+bool should_hack(const std::string &app_name) {
+    std::vector<std::string> black_list = {
+        "com.google.",
+        "com.android.",
+        "android.",
+        "webview_zygote",
+        "com.ldmnq.",  // ldplayer
+        "com.microvirt.",  // memu
+        "WebViewLoader",  // memu
+    };
+
+    for (auto & do_not_hook :  black_list) {
+        if (app_name.rfind(do_not_hook, 0) != std::string::npos) {
+            LOGI("App skipped: %s", app_name.c_str());
+            return false;
+        }
+    }
+
+    LOGI("App started: %s", app_name.c_str());
+
+    return true;
+}
+
+
 void hack_prepare(const char *game_data_dir, void *data, size_t length) {
-    LOGI("hack thread: %d", gettid());
     int api_level = android_get_device_api_level();
-    LOGI("api level: %d", api_level);
 
 #if defined(__i386__) || defined(__x86_64__)
     if (!NativeBridgeLoad(game_data_dir, api_level, data, length)) {
